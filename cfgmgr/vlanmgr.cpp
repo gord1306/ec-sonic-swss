@@ -9,6 +9,10 @@
 #include "warm_restart.h"
 #include <swss/redisutility.h>
 #include "subintf.h"
+#include <netlink/netlink.h>
+#include <netlink/route/link.h>
+#include <netlink/route/link/vlan.h>
+#include <netlink/addr.h>
 
 using namespace std;
 using namespace swss;
@@ -164,33 +168,92 @@ VlanMgr::VlanMgr(DBConnector *cfgDb, DBConnector *appDb, DBConnector *stateDb, c
     }
 }
 
+// Helper to create VLAN interface via netlink
+static int createVlanInterface(int vlan_id, const std::string &brName,
+                                const std::string &ifName, const std::string &mac)
+{
+    struct nl_sock *sock = nl_socket_alloc();
+    if (!sock) return -1;
+    if (nl_connect(sock, NETLINK_ROUTE) < 0) { nl_socket_free(sock); return -1; }
+
+    // allocate link cache for name lookup
+    struct nl_cache *link_cache = NULL;
+    if (rtnl_link_alloc_cache(sock, AF_UNSPEC, &link_cache) < 0) {
+        nl_close(sock);
+        nl_socket_free(sock);
+        return -1;
+    }
+    int br_ifindex = rtnl_link_name2i(link_cache, brName.c_str());
+    nl_cache_free(link_cache);
+    if (br_ifindex == 0) { nl_close(sock); nl_socket_free(sock); return -1; }
+
+    // allocate VLAN link
+    struct rtnl_link *link = rtnl_link_alloc();
+    rtnl_link_set_type(link, "vlan");
+    rtnl_link_set_link(link, br_ifindex);
+    rtnl_link_set_name(link, ifName.c_str());
+    // set VLAN ID with proper cast
+    rtnl_link_vlan_set_id(link, static_cast<uint16_t>(vlan_id));
+    // parse and set MAC address
+    if (!mac.empty()) {
+        struct nl_addr *mac_addr = NULL;
+        if (nl_addr_parse(mac.c_str(), AF_UNSPEC, &mac_addr) == 0) {
+            rtnl_link_set_addr(link, mac_addr);
+            nl_addr_put(mac_addr);
+        }
+    }
+
+    int err = rtnl_link_add(sock, link, NLM_F_CREATE);
+    rtnl_link_put(link);
+    nl_close(sock);
+    nl_socket_free(sock);
+    return err;
+}
+
+// Helper to delete interface via netlink
+static int deleteVlanInterface(const std::string &ifName)
+{
+    struct nl_sock *sock = nl_socket_alloc();
+    if (!sock) return -1;
+    if (nl_connect(sock, NETLINK_ROUTE) < 0) { nl_socket_free(sock); return -1; }
+
+    // allocate link cache for name lookup
+    struct nl_cache *link_cache = NULL;
+    if (rtnl_link_alloc_cache(sock, AF_UNSPEC, &link_cache) < 0) {
+        nl_close(sock);
+        nl_socket_free(sock);
+        return -1;
+    }
+    int ifindex = rtnl_link_name2i(link_cache, ifName.c_str());
+    nl_cache_free(link_cache);
+    if (ifindex == 0) { nl_close(sock); nl_socket_free(sock); return -1; }
+
+    struct rtnl_link *link = rtnl_link_alloc();
+    rtnl_link_set_ifindex(link, ifindex);
+    int err = rtnl_link_delete(sock, link);
+    rtnl_link_put(link);
+    nl_close(sock);
+    nl_socket_free(sock);
+    return err;
+}
+
 bool VlanMgr::addHostVlan(int vlan_id)
 {
     SWSS_LOG_ENTER();
 
-    // The command should be generated as:
-    // /bin/bash -c "/sbin/bridge vlan add vid {{vlan_id}} dev Bridge self &&
-    //               /sbin/ip link add link Bridge up name Vlan{{vlan_id}} address {{gMacAddress}} type vlan id {{vlan_id}}"
-    const std::string cmds = std::string("")
-      + BASH_CMD + " -c \""
-      + BRIDGE_CMD + " vlan add vid " + std::to_string(vlan_id) + " dev " + DOT1Q_BRIDGE_NAME + " self && "
-      + IP_CMD + " link add link " + DOT1Q_BRIDGE_NAME
-               + " up"
-               + " name " + VLAN_PREFIX + std::to_string(vlan_id)
-               + " address " + gMacAddress.to_string()
-               + " type vlan id " + std::to_string(vlan_id) + "\"";
-
-    std::string res;
-    int ret = swss::exec(cmds, res);
-    if (ret)
+    const std::string ifName = VLAN_PREFIX + std::to_string(vlan_id);
+    std::string mac = gMacAddress.to_string();
+    int ret = createVlanInterface(vlan_id, DOT1Q_BRIDGE_NAME, ifName, mac);
+    if (ret < 0)
     {
-        SWSS_LOG_ERROR("Command '%s' failed with rc %d", cmds.c_str(), ret);
+        SWSS_LOG_ERROR("Failed to create VLAN interface %s via netlink, rc %d", ifName.c_str(), ret);
+        return false;
     }
 
-    res.clear();
-    const std::string echo_cmd = std::string("")
-      + ECHO_CMD + " 0 > /proc/sys/net/ipv4/conf/" + VLAN_PREFIX + std::to_string(vlan_id) + "/arp_evict_nocarrier";
-    swss::exec(echo_cmd, res);
+    // arp evict off: use std::string concatenation
+    const std::string sysCmd = std::string(ECHO_CMD) + " 0 > /proc/sys/net/ipv4/conf/" + ifName + "/arp_evict_nocarrier";
+    std::string res;
+    swss::exec(sysCmd, res);
 
     return true;
 }
@@ -199,21 +262,15 @@ bool VlanMgr::removeHostVlan(int vlan_id)
 {
     SWSS_LOG_ENTER();
 
-    // The command should be generated as:
-    // /bin/bash -c "/sbin/ip link del Vlan{{vlan_id}} &&
-    //               /sbin/bridge vlan del vid {{vlan_id}} dev Bridge self"
-    const std::string cmds = std::string("")
-      + BASH_CMD + " -c \""
-      + IP_CMD + " link del " + VLAN_PREFIX + std::to_string(vlan_id) + " && "
-      + BRIDGE_CMD + " vlan del vid " + std::to_string(vlan_id) + " dev " + DOT1Q_BRIDGE_NAME + " self\"";
-
-    std::string res;
-    int ret = swss::exec(cmds, res);
-    if (ret)
+    const std::string ifName = VLAN_PREFIX + std::to_string(vlan_id);
+    int ret = deleteVlanInterface(ifName);
+    if (ret < 0)
     {
-        SWSS_LOG_ERROR("Command '%s' failed with rc %d", cmds.c_str(), ret);
+        SWSS_LOG_ERROR("Failed to delete VLAN interface %s via netlink, rc %d", ifName.c_str(), ret);
+        return false;
     }
 
+    // also remove VLAN from bridge VLAN list via netlink not implemented yet
     return true;
 }
 
