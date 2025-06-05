@@ -62,6 +62,19 @@ private:
     void updateVlanMemberNftRule(int vlan_id, const std::string port_alias, bool is_add);
     void updateVlanMemberNftRule(int vlan_id, bool is_add);
     void removeVlanNeighborSuppression(int vlan_id);
+
+private:
+    // Command generation helpers
+    std::string generate_add_vlan_member_bridge_cmd(int vlan_id, const std::string& port_alias, const std::string& tagging_mode, bool is_default_vlan_member);
+    std::string generate_add_vlan_member_ip_cmd(const std::string& port_alias);
+    std::string generate_remove_vlan_member_bridge_cmd(int vlan_id, const std::string& port_alias);
+    std::string generate_remove_vlan_member_ip_cmd(int vlan_id, const std::string& port_alias); // May need vlan_id to check if it's the last vlan
+
+    bool execute_batch_commands(const std::string& command_prefix, const std::vector<std::string>& commands);
+    bool execute_nft_batch_file(const std::vector<std::string>& nft_commands);
+
+    // Generates an NFT rule string for add/delete. For delete, it will be by content, not handle.
+    std::string generate_nft_rule_command(const std::string &chain_name, const std::string port_alias, bool is_add, int vlan_id);
 };
 
 }
